@@ -1,289 +1,519 @@
 import streamlit as st
-import yfinance as yf
 import pandas as pd
+import yfinance as yf
 import numpy as np
+import io
+from datetime import datetime
 import plotly.express as px
 import plotly.graph_objects as go
-from datetime import datetime
+
+import openpyxl
+from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.chart import BarChart, ScatterChart, Reference, Series
+from openpyxl.chart.trendline import Trendline
+from openpyxl.formatting.rule import ColorScaleRule
 
 # ==========================================
-# 1. PAGE CONFIGURATION & STYLING
+# 1. HELPER FUNCTIONS
 # ==========================================
-st.set_page_config(
-    page_title="Beta & Valuation Dashboard",
-    page_icon="📈",
-    layout="wide"
+
+def format_indian_symbol(raw_input: str) -> str:
+    symbol = raw_input.strip().upper()
+    index_map = {
+        "NIFTY": "^NSEI", "NIFTY 50": "^NSEI", "NIFTY50": "^NSEI",
+        "SENSEX": "^BSESN", "BSE SENSEX": "^BSESN", "BANKNIFTY": "^NSEBANK",
+        "NIFTY BANK": "^NSEBANK", "NIFTY IT": "^CNXIT",
+        "NIFTY MIDCAP": "^NSEMDCP50", "NIFTY SMALLCAP": "^NSI200",
+    }
+    if symbol in index_map: return index_map[symbol]
+    if symbol.startswith("^") or symbol.endswith(".NS") or symbol.endswith(".BO"):
+        return symbol
+    return f"{symbol}.NS"
+
+def clean_sheet_name(name: str) -> str:
+    return name.replace("^", "").replace(":", "_").replace("/", "_").strip()[:30].upper()
+
+@st.cache_data(show_spinner=False)
+def get_financial_metrics(ticker_symbol: str) -> tuple[float, float]:
+    de_ratio, tax_rate = 0.0, 0.25 
+    try:
+        t = yf.Ticker(ticker_symbol)
+        info = t.info or {}
+        
+        d_e_raw = info.get("debtToEquity")
+        if d_e_raw is not None and isinstance(d_e_raw, (int, float)):
+            de_ratio = (d_e_raw / 100.0 if d_e_raw > 5 else float(d_e_raw))
+        else:
+            try:
+                bs = t.balance_sheet
+                if not bs.empty and "Total Debt" in bs.index and "Stockholders Equity" in bs.index:
+                    total_debt = bs.loc["Total Debt"].iloc[0]
+                    total_equity = bs.loc["Stockholders Equity"].iloc[0]
+                    if total_equity and total_equity != 0:
+                        de_ratio = float(total_debt / total_equity)
+            except: pass
+
+        try:
+            inc = t.income_stmt
+            if not inc.empty and "Tax Provision" in inc.index and "Pretax Income" in inc.index:
+                tax_provision = inc.loc["Tax Provision"].iloc[0]
+                pretax_income = inc.loc["Pretax Income"].iloc[0]
+                if pretax_income > 0 and tax_provision > 0:
+                    calc_tax = float(tax_provision / pretax_income)
+                    if 0.05 <= calc_tax <= 0.45: tax_rate = calc_tax
+        except: pass
+    except: pass
+    return round(de_ratio, 4), round(tax_rate, 4)
+
+# ==========================================
+# 2. EXCEL GENERATION LOGIC (WITH CHARTS)
+# ==========================================
+
+def generate_market_excel(
+    data_dict: dict,
+    financials_dict: dict,
+    main_assets: list,
+    comp_map: dict,
+    benchmark_symbol: str,
+    start_date: str,
+    end_date: str,
+    dash_df: pd.DataFrame
+) -> bytes:
+    wb = openpyxl.Workbook()
+    wb.remove(wb.active)
+
+    NAVY_FILL = PatternFill(start_color="1B365D", end_color="1B365D", fill_type="solid")
+    HEADER_FILL = PatternFill(start_color="2C3E50", end_color="2C3E50", fill_type="solid")
+    ZEBRA_FILL = PatternFill(start_color="F9FAFB", end_color="F9FAFB", fill_type="solid")
+
+    FONT_TITLE = Font(name="Calibri", size=14, bold=True, color="FFFFFF")
+    FONT_HEADER = Font(name="Calibri", size=11, bold=True, color="FFFFFF")
+    FONT_BOLD = Font(name="Calibri", size=10, bold=True)
+    FONT_METRIC = Font(name="Calibri", size=11, bold=True, color="1B365D")
+
+    BORDER_THIN = Border(
+        left=Side(style="thin", color="D5D8DC"), right=Side(style="thin", color="D5D8DC"),
+        top=Side(style="thin", color="D5D8DC"), bottom=Side(style="thin", color="D5D8DC"),
+    )
+    ALIGN_CENTER = Alignment(horizontal="center", vertical="center")
+
+    all_symbols = list(data_dict.keys())
+    ordered_sheets = [s for s in main_assets if s in all_symbols]
+    ordered_sheets += [s for s in all_symbols if s not in main_assets and s != benchmark_symbol]
+    if benchmark_symbol in all_symbols:
+        ordered_sheets.append(benchmark_symbol)
+
+    sheet_data_rows = {}
+    bench_clean = clean_sheet_name(benchmark_symbol)
+
+    for user_symbol in ordered_sheets:
+        df = data_dict[user_symbol]
+        sheet_title = clean_sheet_name(user_symbol)
+        ws = wb.create_sheet(title=sheet_title)
+        de_ratio, tax_rate = financials_dict.get(user_symbol, (0.0, 0.25))
+
+        ws.merge_cells("A1:G1")
+        ws["A1"] = f"MARKET DATA: {sheet_title}"
+        ws["A1"].font = FONT_TITLE
+        ws["A1"].fill = NAVY_FILL
+
+        headers = ["Date", "Open", "High", "Low", "Close", "Volume", "Daily Return"]
+        for c_i, h_text in enumerate(headers, start=1):
+            c = ws.cell(row=3, column=c_i, value=h_text)
+            c.fill, c.font, c.alignment, c.border = HEADER_FILL, FONT_HEADER, ALIGN_CENTER, BORDER_THIN
+
+        start_row = 4
+        for i, (idx_dt, row_data) in enumerate(df.iterrows()):
+            r_idx = start_row + i
+            ws.cell(row=r_idx, column=1, value=idx_dt.strftime("%Y-%m-%d")).alignment = ALIGN_CENTER
+            for col, val in enumerate(["Open", "High", "Low", "Close"], start=2):
+                ws.cell(row=r_idx, column=col, value=float(row_data[val])).number_format = "₹#,##0.00"
+            ws.cell(row=r_idx, column=6, value=int(row_data["Volume"])).number_format = "#,##0"
+            
+            if i == 0: ws.cell(row=r_idx, column=7, value=0.0).number_format = "0.00%"
+            else: ws.cell(row=r_idx, column=7, value=f"=(E{r_idx}-E{r_idx-1})/E{r_idx-1}").number_format = "0.00%"
+            
+            for c in range(1, 8):
+                ws.cell(row=r_idx, column=c).border = BORDER_THIN
+                if i % 2 == 1: ws.cell(row=r_idx, column=c).fill = ZEBRA_FILL
+
+        end_row = start_row + len(df) - 1
+        sheet_data_rows[sheet_title] = end_row
+
+        metrics = [
+            ("Avg Daily Return", f"=AVERAGE(G4:G{end_row})", "0.000%"),
+            ("Annual Return", "=J4*252", "0.00%"),
+            ("Daily Vol", f"=_xlfn.STDEV.S(G4:G{end_row})", "0.000%"),
+            ("Annual Vol", "=J6*SQRT(252)", "0.00%"),
+            ("Daily Var", f"=_xlfn.VAR.S(G4:G{end_row})", "0.00000"),
+            (f"Covariance ({bench_clean})", f"=_xlfn.COVARIANCE.S(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00000"),
+            (f"Bench Var", f"=_xlfn.VAR.S('{bench_clean}'!G4:G{end_row})", "0.00000"),
+            ("Beta (Ratio)", "=IF(J10=0, 1, J9/J10)", "0.00"),
+            ("Levered Beta", f"=SLOPE(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00"),
+            ("D/E Ratio", de_ratio, "0.00%"),
+            ("Tax Rate", tax_rate, "0.00%"),
+            ("Unlevered Beta", "=J12/(1+(1-J14)*J13)", "0.00"),
+            ("Correlation", f"=CORREL(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.000")
+        ]
+        
+        for m_idx, (label, form, fmt) in enumerate(metrics, start=4):
+            ws.cell(row=m_idx, column=9, value=label).font = FONT_BOLD
+            c_val = ws.cell(row=m_idx, column=10, value=form)
+            c_val.font = FONT_METRIC
+            c_val.number_format = fmt
+
+        ws.column_dimensions["G"].width = 15
+        ws.column_dimensions["I"].width = 25
+        ws.column_dimensions["J"].width = 15
+
+        # Embed Regression Scatter Plot for Target Companies
+        if user_symbol in main_assets and benchmark_symbol in data_dict:
+            sc = ScatterChart()
+            sc.title = f"{sheet_title} vs {bench_clean} Regression"
+            sc.style = 13
+            sc.x_axis.title = f"{bench_clean} Returns"
+            sc.y_axis.title = f"{sheet_title} Returns"
+            sc.width, sc.height = 15, 10
+            
+            bench_sheet = wb[bench_clean]
+            # Assumes same chronological rows 
+            x_values = Reference(bench_sheet, min_col=7, min_row=4, max_row=end_row)
+            y_values = Reference(ws, min_col=7, min_row=4, max_row=end_row)
+            
+            series = Series(y_values, x_values, title_from_data=False)
+            series.marker.symbol = "circle"
+            series.graphicalProperties.line.noFill = True # Remove connecting lines
+            series.trendline = Trendline(trendlineType="linear") # Add OLS Regression Line
+            
+            sc.series.append(series)
+            ws.add_chart(sc, "M15")
+
+    # ==========================
+    # Executive Summary Sheet
+    # ==========================
+    ws_summary = wb.create_sheet(title="Executive Summary", index=0)
+    ws_summary.views.sheetView[0].showGridLines = True
+    ws_summary.merge_cells("A1:K1")
+    ws_summary["A1"] = f"QUANTITATIVE ANALYSIS ({start_date} to {end_date})"
+    ws_summary["A1"].font, ws_summary["A1"].fill = FONT_TITLE, NAVY_FILL
+
+    headers_summary = ["Asset", "Avg Daily Ret", "Ann Return", "Ann Volatility", "Levered Beta", "D/E Ratio", "Tax Rate", "Unlevered Beta", "Peer Unlevered Beta", "Peer Relevered Beta", "Correlation"]
+    
+    for col_idx, text in enumerate(headers_summary, start=1):
+        c = ws_summary.cell(row=3, column=col_idx, value=text)
+        c.fill, c.font, c.alignment, c.border = HEADER_FILL, FONT_HEADER, ALIGN_CENTER, BORDER_THIN
+        ws_summary.column_dimensions[get_column_letter(col_idx)].width = 20
+
+    for idx, row in dash_df.iterrows():
+        s_row = 4 + idx
+        ws_summary.cell(row=s_row, column=1, value=row["Asset"]).font = FONT_BOLD
+        ws_summary.cell(row=s_row, column=2, value=row["Ann Return"]/252).number_format = "0.000%"
+        ws_summary.cell(row=s_row, column=3, value=row["Ann Return"]).number_format = "0.00%"
+        ws_summary.cell(row=s_row, column=4, value=row["Ann Volatility"]).number_format = "0.00%"
+        ws_summary.cell(row=s_row, column=5, value=row["Raw Levered Beta"]).number_format = "0.00"
+        ws_summary.cell(row=s_row, column=6, value=row["D/E Ratio"]).number_format = "0.00%"
+        ws_summary.cell(row=s_row, column=7, value=financials_dict.get(row["Asset"], (0.0, 0.25))[1]).number_format = "0.00%"
+        ws_summary.cell(row=s_row, column=8, value=row["Unlevered Beta"]).number_format = "0.00"
+        ws_summary.cell(row=s_row, column=9, value=row["Peer Avg Unlevered Beta"]).number_format = "0.00"
+        ws_summary.cell(row=s_row, column=10, value=row["Peer Relevered Beta"]).number_format = "0.00"
+        ws_summary.cell(row=s_row, column=11, value=row["Correlation"]).number_format = "0.000"
+
+        for c_i in range(1, 12):
+            ws_summary.cell(row=s_row, column=c_i).border = BORDER_THIN
+
+    # Embed Native Excel Bar Chart for specific Betas (Raw, Unlevered, Peer Relevered)
+    chart = BarChart()
+    chart.type = "col"
+    chart.style = 10
+    chart.title = "Beta Comparison by Asset"
+    chart.y_axis.title = "Beta Value"
+    chart.x_axis.title = "Assets"
+
+    cats_ref = Reference(ws_summary, min_col=1, min_row=4, max_row=3 + len(dash_df))
+    
+    # Selecting Specific non-contiguous columns for the bar chart
+    s1 = Series(Reference(ws_summary, min_col=5, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Raw Levered
+    s2 = Series(Reference(ws_summary, min_col=8, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Unlevered
+    s3 = Series(Reference(ws_summary, min_col=10, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Peer Relevered
+    
+    chart.series.extend([s1, s2, s3])
+    chart.set_categories(cats_ref)
+    chart.width = 18
+    chart.height = 10
+    ws_summary.add_chart(chart, "M3")
+
+    # ==========================
+    # Correlation Heatmap Sheet
+    # ==========================
+    ws_corr = wb.create_sheet(title="Correlation Heatmap", index=1)
+    returns_df = pd.DataFrame()
+    for sym in main_assets:
+        if sym in data_dict:
+            returns_df[sym] = data_dict[sym]['Close'].pct_change()
+    corr_matrix = returns_df.corr()
+    
+    ws_corr.cell(row=1, column=1, value="Asset").font = FONT_BOLD
+    for c_idx, col_name in enumerate(corr_matrix.columns, 2):
+        ws_corr.cell(row=1, column=c_idx, value=col_name).font = FONT_BOLD
+        
+    for r_idx, row_name in enumerate(corr_matrix.index, 2):
+        ws_corr.cell(row=r_idx, column=1, value=row_name).font = FONT_BOLD
+        for c_idx, col_name in enumerate(corr_matrix.columns, 2):
+            val = corr_matrix.loc[row_name, col_name]
+            c = ws_corr.cell(row=r_idx, column=c_idx, value=val)
+            c.number_format = "0.00"
+            c.border = BORDER_THIN
+            
+    rule = ColorScaleRule(start_type='min', start_color='F8696B', 
+                          mid_type='num', mid_value=0, mid_color='FFEB84', 
+                          end_type='max', end_color='63BE7B')
+    ws_corr.conditional_formatting.add(f"B2:{get_column_letter(len(corr_matrix.columns)+1)}{len(corr_matrix.index)+1}", rule)
+
+    output = io.BytesIO()
+    wb.save(output)
+    return output.getvalue()
+
+
+# ==========================================
+# 3. STREAMLIT APP UI & LOGIC
+# ==========================================
+
+st.set_page_config(page_title="Beta & Risk Analytics", layout="wide", initial_sidebar_state="expanded")
+
+st.title("📈 Advanced Cost of Capital & Beta Dashboard")
+st.markdown("Analyze market risk, compute unlevered betas, and handle custom competitor peer groups dynamically.")
+
+# --- SIDEBAR CONFIGURATION ---
+st.sidebar.header("Configuration")
+
+mode = st.sidebar.radio(
+    "Select Output Mode",
+    ["Interactive Dashboard Only", "Excel Workbook with Charts Only", "Generate Both"]
 )
 
-st.title("📈 Beta Calculation & Valuation Dashboard")
-st.markdown("Accurate Financial Beta, Unlevered Beta, Peer Relevered Beta, and Regression Analysis.")
+start_date = st.sidebar.date_input("Start Date", datetime(2021, 4, 1))
+end_date = st.sidebar.date_input("End Date", datetime(2026, 3, 31))
+benchmark_input = st.sidebar.text_input("Benchmark Index", "NIFTY 50")
 
-# ==========================================
-# 2. SIDEBAR - INPUTS & CONFIGURATION
-# ==========================================
-st.sidebar.header("1. Portfolio & Date Settings")
+# --- MAIN INPUTS ---
+col1, col2 = st.columns([1, 1])
 
-# Date range selection (Defaulted to requested dates)
-start_date = st.sidebar.date_input("Start Date", datetime.strptime("2021-04-01", "%Y-%m-%d"))
-end_date = st.sidebar.date_input("End Date", datetime.strptime("2026-03-31", "%Y-%m-%d"))
-
-st.sidebar.subheader("Tickers")
-target_ticker = st.sidebar.text_input("Target Company Ticker", value="TCS.NS").strip().upper()
-peer_tickers_input = st.sidebar.text_input("Peer Tickers (comma-separated)", value="INFY.NS, WIT, TECHM.NS, HCLTECH.NS")
-benchmark_ticker = st.sidebar.text_input("Benchmark Market Index", value="^NSEI").strip().upper()
-
-# Parse peer list
-peer_list = [p.strip().upper() for p in peer_tickers_input.split(",") if p.strip()]
-all_tickers = list(dict.fromkeys([target_ticker] + peer_list + [benchmark_ticker]))
-
-st.sidebar.markdown("---")
-st.sidebar.header("2. Capital Structure Inputs")
-
-# Interactive financial inputs for target and peers
-financial_data = {}
-
-st.sidebar.subheader(f"Target: {target_ticker}")
-t_debt = st.sidebar.number_input(f"{target_ticker} Total Debt", value=1000.0, step=100.0)
-t_equity = st.sidebar.number_input(f"{target_ticker} Market Equity", value=10000.0, step=500.0)
-t_tax = st.sidebar.number_input(f"{target_ticker} Tax Rate (%)", value=25.0, step=1.0) / 100.0
-
-financial_data[target_ticker] = {"Debt": t_debt, "Equity": t_equity, "Tax_Rate": t_tax}
-
-with st.sidebar.expander("Peer Financial Inputs", expanded=False):
-    for peer in peer_list:
-        st.markdown(f"**{peer}**")
-        p_debt = st.number_input(f"{peer} Debt", value=500.0, step=50.0, key=f"d_{peer}")
-        p_equity = st.number_input(f"{peer} Equity", value=5000.0, step=250.0, key=f"e_{peer}")
-        p_tax = st.number_input(f"{peer} Tax Rate (%)", value=25.0, step=1.0, key=f"t_{peer}") / 100.0
-        financial_data[peer] = {"Debt": p_debt, "Equity": p_equity, "Tax_Rate": p_tax}
-
-# ==========================================
-# 3. DATA FETCHING & COMPUTATION ENGINE
-# ==========================================
-@st.cache_data(ttl=3600)
-def fetch_financial_data(tickers, start, end):
-    data = yf.download(tickers, start=start, end=end)['Adj Close']
-    if isinstance(data, pd.Series):
-        data = data.to_frame()
-    return data
-
-try:
-    with st.spinner("Fetching market data..."):
-        price_df = fetch_financial_data(all_tickers, start_date, end_date)
-
-    # Drop missing values across all tickers for date alignment
-    price_df = price_df.dropna()
+with col1:
+    main_tickers_str = st.text_input("Target Companies (comma-separated)", "TCS, INFY, HCLTECH, RELIANCE")
     
-    # Calculate simple daily percentage returns (Matches Excel PERCENTCHANGE / SLOPE)
-    returns_df = price_df.pct_change().dropna()
+with col2:
+    with st.expander("⚙️ Optional Competitor Mapping (Advanced)", expanded=False):
+        st.markdown("""
+        *Specify custom peers per company to override default peer averaging.*  
+        **Format:** `Target = Peer1, Peer2`  
+        **Example:**  
+        `TCS = INFY, WIPRO`  
+        `RELIANCE = ONGC, BPCL`  
+        *(If left blank for any company, it defaults to averaging the other Target Companies).*
+        """)
+        custom_peers_str = st.text_area("Competitor Rules", height=100, placeholder="TCS = INFY, WIPRO")
 
-    if benchmark_ticker not in returns_df.columns:
-        st.error(f"Benchmark ticker '{benchmark_ticker}' not found in fetched data.")
+if st.button("Run Financial Analysis", type="primary"):
+    main_assets = [s.strip().upper() for s in main_tickers_str.split(",") if s.strip()]
+    if not main_assets:
+        st.error("Please enter at least one target company.")
         st.stop()
 
-    benchmark_returns = returns_df[benchmark_ticker]
+    comp_map = {}
+    additional_peers = []
+    if 'custom_peers_str' in locals() and custom_peers_str.strip():
+        for line in custom_peers_str.strip().split("\n"):
+            if "=" in line:
+                target, peers = line.split("=")
+                target = target.strip().upper()
+                peer_list = [p.strip().upper() for p in peers.split(",") if p.strip()]
+                comp_map[target] = peer_list
+                additional_peers.extend(peer_list)
 
-    # Calculate Raw Levered Betas using OLS Covariance / Variance ratio (Excel SLOPE equivalent)
-    results = []
-    market_var = np.var(benchmark_returns, ddof=1)
+    all_symbols_to_fetch = list(set(main_assets + additional_peers))
+    bench_symbol = benchmark_input.strip().upper()
+    if bench_symbol not in all_symbols_to_fetch:
+        all_symbols_to_fetch.append(bench_symbol)
 
-    for ticker in [target_ticker] + peer_list:
-        if ticker in returns_df.columns:
-            stock_returns = returns_df[ticker]
-            
-            # Covariance stock vs market
-            cov_matrix = np.cov(stock_returns, benchmark_returns)
-            raw_beta = cov_matrix[0, 1] / market_var
-            
-            # Correlation with benchmark (Excel CORREL equivalent)
-            correlation = np.corrcoef(stock_returns, benchmark_returns)[0, 1]
-            
-            # R-Squared
-            r_squared = correlation ** 2
-            
-            # Capital Structure calculations
-            debt = financial_data[ticker]["Debt"]
-            equity = financial_data[ticker]["Equity"]
-            tax_rate = financial_data[ticker]["Tax_Rate"]
-            de_ratio = debt / equity if equity > 0 else 0
-            
-            # Unlevered Beta (Hamada equation)
-            unlevered_beta = raw_beta / (1 + (1 - tax_rate) * de_ratio)
-
-            results.append({
-                "Ticker": ticker,
-                "Type": "Target" if ticker == target_ticker else "Peer",
-                "Market Cap / Equity": equity,
-                "Total Debt": debt,
-                "D/E Ratio": de_ratio,
-                "Tax Rate (%)": tax_rate * 100,
-                "Raw Levered Beta": raw_beta,
-                "Unlevered Beta": unlevered_beta,
-                "Correlation": correlation,
-                "R-Squared": r_squared
-            })
-
-    results_df = pd.DataFrame(results)
-
-    # Peer Average & Median Unlevered Beta
-    peer_unlevered_betas = results_df[results_df["Type"] == "Peer"]["Unlevered Beta"]
-    avg_peer_unlevered_beta = peer_unlevered_betas.mean() if not peer_unlevered_betas.empty else results_df[results_df["Ticker"] == target_ticker]["Unlevered Beta"].values[0]
-
-    # Target Relevered Beta (using Peer Average Unlevered Beta)
-    target_de = financial_data[target_ticker]["Debt"] / financial_data[target_ticker]["Equity"]
-    target_tax = financial_data[target_ticker]["Tax_Rate"]
-    target_relevered_beta = avg_peer_unlevered_beta * (1 + (1 - target_tax) * target_de)
-
-    # ==========================================
-    # 4. DASHBOARD DISPLAY
-    # ==========================================
-    
-    # Key Summary Metrics
-    target_row = results_df[results_df["Ticker"] == target_ticker].iloc[0]
-    
-    col1, col2, col3, col4 = st.columns(4)
-    col1.metric("Raw Levered Beta", f"{target_row['Raw Levered Beta']:.3f}")
-    col2.metric("Target Unlevered Beta", f"{target_row['Unlevered Beta']:.3f}")
-    col3.metric("Peer Avg Unlevered Beta", f"{avg_peer_unlevered_beta:.3f}")
-    col4.metric("Target Relevered Beta", f"{target_relevered_beta:.3f}", delta=f"{target_relevered_beta - target_row['Raw Levered Beta']:.3f} vs Raw")
-
-    st.markdown("---")
-
-    # Layout: Visualizations
-    tab1, tab2, tab3, tab4 = st.tabs(["📉 Regression Scatter Plot", "📊 Beta Comparison Bar Chart", "🔥 Correlation Heatmap", "📋 Detailed Data Table"])
-
-    # -------------------------------------------------------------
-    # TAB 1: Target Regression Scatter Plot (OLS Line)
-    # -------------------------------------------------------------
-    with tab1:
-        st.subheader(f"Target ({target_ticker}) vs Benchmark ({benchmark_ticker}) Regression Scatter Plot")
+    with st.spinner("Downloading market data and computing metrics..."):
+        fetched_data = {}
+        financials_data = {}
         
-        target_ret = returns_df[target_ticker]
-        bench_ret = returns_df[benchmark_ticker]
+        yf_start = start_date.strftime("%Y-%m-%d")
+        yf_end = end_date.strftime("%Y-%m-%d")
 
-        # Calculate linear regression line parameters (y = mx + c)
-        slope, intercept = np.polyfit(bench_ret, target_ret, 1)
-        line_x = np.linspace(bench_ret.min(), bench_ret.max(), 100)
-        line_y = slope * line_x + intercept
+        for sym in all_symbols_to_fetch:
+            ticker = format_indian_symbol(sym)
+            try:
+                stock = yf.Ticker(ticker)
+                df = stock.history(start=yf_start, end=yf_end)
+                if not df.empty:
+                    df.index = df.index.tz_localize(None)
+                    fetched_data[sym] = df
+                    financials_data[sym] = get_financial_metrics(ticker)
+            except Exception as e:
+                st.warning(f"Failed to fetch {sym}: {e}")
 
-        fig_scatter = go.Figure()
+        if bench_symbol not in fetched_data:
+            st.error(f"Could not fetch benchmark '{bench_symbol}'. Please verify the ticker.")
+            st.stop()
 
-        # Scatter points
-        fig_scatter.add_trace(go.Scatter(
-            x=bench_ret,
-            y=target_ret,
-            mode='markers',
-            name='Daily Returns',
-            marker=dict(color='#1f77b4', opacity=0.6, size=5)
-        ))
+    bench_df = fetched_data[bench_symbol]['Close']
+    bench_ret = bench_df.pct_change().dropna()
 
-        # Regression Line
-        fig_scatter.add_trace(go.Scatter(
-            x=line_x,
-            y=line_y,
-            mode='lines',
-            name=f'OLS Trendline (Beta = {slope:.3f})',
-            line=dict(color='#ff7f0e', width=2)
-        ))
-
-        fig_scatter.update_layout(
-            title=f"Linear Regression: {target_ticker} vs {benchmark_ticker}<br><sup>Equation: Returns({target_ticker}) = {slope:.3f} × Returns({benchmark_ticker}) + ({intercept:.5f}) | R² = {target_row['R-Squared']:.3f}</sup>",
-            xaxis_title=f"Benchmark Return ({benchmark_ticker})",
-            yaxis_title=f"Target Return ({target_ticker})",
-            template="plotly_white",
-            height=500
-        )
-
-        st.plotly_chart(fig_scatter, use_container_width=True)
-
-    # -------------------------------------------------------------
-    # TAB 2: Bar Chart - Raw, Unlevered, & Relevered Betas
-    # -------------------------------------------------------------
-    with tab2:
-        st.subheader("Beta Comparison Breakdown")
+    metrics_cache = {}
+    for sym in all_symbols_to_fetch:
+        if sym == bench_symbol: continue
+        if sym not in fetched_data: continue
+        target_ret = fetched_data[sym]['Close'].pct_change().dropna()
         
-        # Prepare data for Beta comparison
-        target_raw = target_row['Raw Levered Beta']
-        target_unlevered = target_row['Unlevered Beta']
+        # ALIGNMENT: Prevents Variance discrepancies compared to Excel's SLOPE() 
+        aligned = pd.concat([target_ret, bench_ret], axis=1).dropna()
+        aligned.columns = ['Target', 'Bench']
         
-        beta_comp_df = pd.DataFrame({
-            "Beta Metric": ["Raw Levered Beta", "Unlevered Beta", "Peer Relevered Beta"],
-            "Value": [target_raw, target_unlevered, target_relevered_beta]
+        mean_ret = aligned['Target'].mean()
+        ann_ret = mean_ret * 252
+        ann_vol = aligned['Target'].std() * np.sqrt(252)
+        
+        bench_var = aligned['Bench'].var() # Calculating strictly on overlapping mapped values
+        cov = aligned.cov().iloc[0, 1]
+        
+        beta_l = cov / bench_var if bench_var != 0 else 1
+        de, tax = financials_data.get(sym, (0.0, 0.25))
+        beta_u = beta_l / (1 + (1 - tax) * de)
+        corr = aligned['Target'].corr(aligned['Bench'])
+        
+        metrics_cache[sym] = {
+            "mean_ret": mean_ret, "ann_ret": ann_ret, "ann_vol": ann_vol,
+            "beta_l": beta_l, "de": de, "tax": tax, "beta_u": beta_u, "corr": corr
+        }
+
+    dashboard_data = []
+    for sym in main_assets:
+        if sym not in metrics_cache: continue
+        m = metrics_cache[sym]
+        
+        # Dynamic Custom Competitor Logic Evaluation
+        peer_u_beta = 0
+        if sym in comp_map and comp_map[sym]:
+            peers = [p for p in comp_map[sym] if p in metrics_cache]
+            if peers:
+                peer_u_beta = np.mean([metrics_cache[p]["beta_u"] for p in peers])
+            else: peer_u_beta = np.nan
+        else:
+            peers = [p for p in main_assets if p != sym and p in metrics_cache]
+            if peers:
+                peer_u_beta = np.mean([metrics_cache[p]["beta_u"] for p in peers])
+            else: peer_u_beta = np.nan
+            
+        peer_rel_beta = peer_u_beta * (1 + (1 - m["tax"]) * m["de"]) if not np.isnan(peer_u_beta) else np.nan
+
+        dashboard_data.append({
+            "Asset": sym,
+            "Ann Return": m["ann_ret"],
+            "Ann Volatility": m["ann_vol"],
+            "Raw Levered Beta": m["beta_l"],
+            "D/E Ratio": m["de"],
+            "Unlevered Beta": m["beta_u"],
+            "Peer Avg Unlevered Beta": peer_u_beta,
+            "Peer Relevered Beta": peer_rel_beta,
+            "Correlation": m["corr"]
         })
 
-        fig_bar = px.bar(
-            beta_comp_df,
-            x="Beta Metric",
-            y="Value",
-            text_auto='.3f',
-            color="Beta Metric",
-            color_discrete_sequence=['#2b5c8f', '#4682b4', '#d9534f'],
-            title=f"Target ({target_ticker}) Beta Transition Analysis"
-        )
+    dash_df = pd.DataFrame(dashboard_data)
+    st.session_state['dash_df'] = dash_df
+    st.session_state['fetched_data'] = fetched_data
+    st.session_state['financials_data'] = financials_data
+    st.session_state['main_assets'] = main_assets
+    st.session_state['comp_map'] = comp_map
+    st.session_state['bench_symbol'] = bench_symbol
+    st.session_state['yf_start'] = yf_start
+    st.session_state['yf_end'] = yf_end
+    st.session_state['ran_analysis'] = True
 
-        fig_bar.update_layout(
-            yaxis_title="Beta Coefficient",
-            showlegend=False,
-            template="plotly_white",
-            height=450
-        )
+if 'ran_analysis' in st.session_state and st.session_state['ran_analysis']:
+    dash_df = st.session_state['dash_df']
+    fetched_data = st.session_state['fetched_data']
+    financials_data = st.session_state['financials_data']
+    main_assets = st.session_state['main_assets']
+    comp_map = st.session_state['comp_map']
+    bench_symbol = st.session_state['bench_symbol']
+    yf_start = st.session_state['yf_start']
+    yf_end = st.session_state['yf_end']
 
-        st.plotly_chart(fig_bar, use_container_width=True)
+    show_dash = mode in ["Interactive Dashboard Only", "Generate Both"]
+    show_excel = mode in ["Excel Workbook with Charts Only", "Generate Both"]
 
-    # -------------------------------------------------------------
-    # TAB 3: Correlation Heatmap
-    # -------------------------------------------------------------
-    with tab3:
-        st.subheader("Returns Correlation Heatmap")
+    if show_dash:
+        st.divider()
+        st.subheader("📊 Executive Summary Dashboard")
         
-        # Filter return columns for target, peers, and benchmark
-        corr_tickers = [t for t in all_tickers if t in returns_df.columns]
-        corr_matrix = returns_df[corr_tickers].corr()
-
-        fig_heatmap = px.imshow(
-            corr_matrix,
-            text_auto='.2f',
-            color_continuous_scale='Blues',
-            title="Correlation Matrix across Target, Peers & Benchmark",
-            aspect="auto"
-        )
-
-        fig_heatmap.update_layout(height=500)
-        st.plotly_chart(fig_heatmap, use_container_width=True)
-
-    # -------------------------------------------------------------
-    # TAB 4: Detailed Summary Data Table
-    # -------------------------------------------------------------
-    with tab4:
-        st.subheader("Summary Table")
-        
-        display_df = results_df.copy()
-        display_df.loc[len(display_df)] = {
-            "Ticker": f"RELEVERED ({target_ticker})",
-            "Type": "Target Relevered",
-            "Market Cap / Equity": target_row["Market Cap / Equity"],
-            "Total Debt": target_row["Total Debt"],
-            "D/E Ratio": target_de,
-            "Tax Rate (%)": target_tax * 100,
-            "Raw Levered Beta": np.nan,
-            "Unlevered Beta": avg_peer_unlevered_beta,
-            "Correlation": np.nan,
-            "R-Squared": np.nan
+        formatted_df = dash_df.copy()
+        format_dict = {
+            "Ann Return": "{:.2%}", "Ann Volatility": "{:.2%}", "D/E Ratio": "{:.2%}",
+            "Raw Levered Beta": "{:.2f}", "Unlevered Beta": "{:.2f}",
+            "Peer Avg Unlevered Beta": "{:.2f}", "Peer Relevered Beta": "{:.2f}", "Correlation": "{:.3f}"
         }
-        
-        st.dataframe(
-            display_df.style.format({
-                "Market Cap / Equity": "{:,.1f}",
-                "Total Debt": "{:,.1f}",
-                "D/E Ratio": "{:.2%}",
-                "Tax Rate (%)": "{:.1f}%",
-                "Raw Levered Beta": "{:.3f}",
-                "Unlevered Beta": "{:.3f}",
-                "Correlation": "{:.3f}",
-                "R-Squared": "{:.3f}"
-            }, na_rep="-"),
-            use_container_width=True
-        )
+        st.dataframe(formatted_df.style.format(format_dict).background_gradient(cmap='Blues', subset=['Raw Levered Beta', 'Peer Relevered Beta']), use_container_width=True)
 
-except Exception as e:
-    st.error(f"An error occurred while processing data: {str(e)}")
+        st.divider()
+        c1, c2 = st.columns(2)
+        with c1:
+            st.subheader("Cost of Capital Beta Comparison")
+            bar_df = dash_df.melt(id_vars='Asset', value_vars=['Raw Levered Beta', 'Unlevered Beta', 'Peer Relevered Beta'], var_name='Metric', value_name='Beta')
+            fig1 = px.bar(bar_df, x='Asset', y='Beta', color='Metric', barmode='group', text_auto='.2f',
+                          color_discrete_sequence=['#1B365D', '#6CA0DC', '#E67E22'])
+            fig1.update_layout(xaxis_title="", yaxis_title="Beta Value", legend_title="")
+            st.plotly_chart(fig1, use_container_width=True)
+
+        with c2:
+            st.subheader("Asset Correlation Heatmap")
+            returns_df = pd.DataFrame()
+            for sym in main_assets:
+                if sym in fetched_data:
+                    returns_df[sym] = fetched_data[sym]['Close'].pct_change()
+            corr_matrix = returns_df.corr()
+            
+            fig2 = px.imshow(corr_matrix, text_auto='.2f', color_continuous_scale='RdYlGn', aspect="auto")
+            st.plotly_chart(fig2, use_container_width=True)
+
+        st.divider()
+        st.subheader(f"📈 Regression Scatter Plots (Target vs {bench_symbol})")
+        scatter_cols = st.columns(2)
+        idx = 0
+        
+        for sym in main_assets:
+            if sym in fetched_data and bench_symbol in fetched_data:
+                target_ret = fetched_data[sym]['Close'].pct_change().dropna()
+                b_ret = fetched_data[bench_symbol]['Close'].pct_change().dropna()
+                
+                aligned = pd.concat([target_ret, b_ret], axis=1).dropna()
+                aligned.columns = [sym, bench_symbol]
+                
+                # Math for custom linear regression line
+                m, c_y = np.polyfit(aligned[bench_symbol], aligned[sym], 1)
+                
+                fig_scat = px.scatter(aligned, x=bench_symbol, y=sym, opacity=0.6, title=f"{sym} Regression")
+                fig_scat.add_trace(go.Scatter(
+                    x=aligned[bench_symbol], y=m*aligned[bench_symbol] + c_y, 
+                    mode='lines', name='OLS Trendline', line=dict(color='red')
+                ))
+                fig_scat.update_layout(xaxis_title=f"{bench_symbol} Daily Return", yaxis_title=f"{sym} Daily Return")
+                scatter_cols[idx % 2].plotly_chart(fig_scat, use_container_width=True)
+                idx += 1
+
+    if show_excel:
+        st.divider()
+        st.subheader("📥 Excel Export with Native Charts")
+        excel_bytes = generate_market_excel(
+            fetched_data, financials_data, main_assets, comp_map, bench_symbol,
+            yf_start, yf_end, dash_df
+        )
+        st.download_button(
+            label="Download Complete Analytical Workbook (.xlsx)",
+            data=excel_bytes,
+            file_name=f"Financial_Model_{yf_start}_to_{yf_end}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            type="primary"
+        )
