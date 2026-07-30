@@ -145,21 +145,21 @@ def generate_market_excel(
 
         end_row = start_row + len(df) - 1
 
-        # Statistical functions start at G5 to exclude Row 4 (0.0% base return)
+        # Statistical functions start at G4 to include the initial 0.0% base return
         metrics = [
-            ("Avg Daily Return", f"=AVERAGE(G5:G{end_row})", "0.000%"),
+            ("Avg Daily Return", f"=AVERAGE(G4:G{end_row})", "0.000%"),
             ("Annual Return", "=J4*252", "0.00%"),
-            ("Daily Vol", f"=_xlfn.STDEV.S(G5:G{end_row})", "0.000%"),
+            ("Daily Vol", f"=_xlfn.STDEV.S(G4:G{end_row})", "0.000%"),
             ("Annual Vol", "=J6*SQRT(252)", "0.00%"),
-            ("Daily Var", f"=_xlfn.VAR.S(G5:G{end_row})", "0.00000"),
-            (f"Covariance ({bench_clean})", f"=_xlfn.COVARIANCE.S(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.00000"),
-            (f"Bench Var", f"=_xlfn.VAR.S('{bench_clean}'!G5:G{end_row})", "0.00000"),
+            ("Daily Var", f"=_xlfn.VAR.S(G4:G{end_row})", "0.00000"),
+            (f"Covariance ({bench_clean})", f"=_xlfn.COVARIANCE.S(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00000"),
+            (f"Bench Var", f"=_xlfn.VAR.S('{bench_clean}'!G4:G{end_row})", "0.00000"),
             ("Beta (Ratio)", "=IF(J10=0, 1, J9/J10)", "0.00"),
-            ("Levered Beta", f"=SLOPE(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.00"),
+            ("Levered Beta", f"=SLOPE(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00"),
             ("D/E Ratio", de_ratio, "0.00%"),
             ("Tax Rate", tax_rate, "0.00%"),
             ("Unlevered Beta", "=J12/(1+(1-J14)*J13)", "0.00"),
-            ("Correlation", f"=CORREL(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.000")
+            ("Correlation", f"=CORREL(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.000")
         ]
         
         for m_idx, (label, form, fmt) in enumerate(metrics, start=4):
@@ -172,7 +172,7 @@ def generate_market_excel(
         ws.column_dimensions["I"].width = 25
         ws.column_dimensions["J"].width = 15
 
-        # Regression Scatter Chart inside Target Asset worksheets
+        # Regression Scatter Chart inside Target Asset worksheets (starts at row 4)
         if user_symbol in main_assets and benchmark_symbol in data_dict:
             sc = ScatterChart()
             sc.title = f"{sheet_title} vs {bench_clean} Regression"
@@ -182,8 +182,8 @@ def generate_market_excel(
             sc.width, sc.height = 15, 10
             
             bench_sheet = wb[bench_clean]
-            x_values = Reference(bench_sheet, min_col=7, min_row=5, max_row=end_row)
-            y_values = Reference(ws, min_col=7, min_row=5, max_row=end_row)
+            x_values = Reference(bench_sheet, min_col=7, min_row=4, max_row=end_row)
+            y_values = Reference(ws, min_col=7, min_row=4, max_row=end_row)
             
             series = Series(y_values, x_values, title_from_data=False)
             series.marker.symbol = "circle"
@@ -252,7 +252,7 @@ def generate_market_excel(
     returns_df = pd.DataFrame()
     for sym in main_assets:
         if sym in data_dict:
-            returns_df[sym] = data_dict[sym]['Close'].pct_change()
+            returns_df[sym] = data_dict[sym]['Close'].pct_change().fillna(0.0)
     corr_matrix = returns_df.corr()
     
     ws_corr.cell(row=1, column=1, value="Asset").font = FONT_BOLD
@@ -367,15 +367,15 @@ if st.button("Run Financial Analysis", type="primary"):
             fetched_data[sym] = fetched_data[sym].loc[common_dates].copy()
 
     bench_df = fetched_data[bench_symbol]['Close']
-    bench_ret = bench_df.pct_change().dropna()
+    bench_ret = bench_df.pct_change().fillna(0.0)
 
     metrics_cache = {}
     for sym in all_symbols_to_fetch:
         if sym == bench_symbol: continue
         if sym not in fetched_data: continue
-        target_ret = fetched_data[sym]['Close'].pct_change().dropna()
+        target_ret = fetched_data[sym]['Close'].pct_change().fillna(0.0)
         
-        aligned = pd.concat([target_ret, bench_ret], axis=1).dropna()
+        aligned = pd.concat([target_ret, bench_ret], axis=1)
         aligned.columns = ['Target', 'Bench']
         
         mean_ret = aligned['Target'].mean()
@@ -477,7 +477,7 @@ if 'ran_analysis' in st.session_state and st.session_state['ran_analysis']:
             returns_df = pd.DataFrame()
             for sym in main_assets:
                 if sym in fetched_data:
-                    returns_df[sym] = fetched_data[sym]['Close'].pct_change()
+                    returns_df[sym] = fetched_data[sym]['Close'].pct_change().fillna(0.0)
             corr_matrix = returns_df.corr()
             
             fig2 = px.imshow(corr_matrix, text_auto='.2f', color_continuous_scale='RdYlGn', aspect="auto")
@@ -490,10 +490,10 @@ if 'ran_analysis' in st.session_state and st.session_state['ran_analysis']:
         
         for sym in main_assets:
             if sym in fetched_data and bench_symbol in fetched_data:
-                target_ret = fetched_data[sym]['Close'].pct_change().dropna()
-                b_ret = fetched_data[bench_symbol]['Close'].pct_change().dropna()
+                target_ret = fetched_data[sym]['Close'].pct_change().fillna(0.0)
+                b_ret = fetched_data[bench_symbol]['Close'].pct_change().fillna(0.0)
                 
-                aligned = pd.concat([target_ret, b_ret], axis=1).dropna()
+                aligned = pd.concat([target_ret, b_ret], axis=1)
                 aligned.columns = [sym, bench_symbol]
                 
                 m, c_y = np.polyfit(aligned[bench_symbol], aligned[sym], 1)
