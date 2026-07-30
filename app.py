@@ -348,7 +348,7 @@ if st.button("Run Financial Analysis", type="primary"):
                 df = stock.history(start=yf_start, end=yf_end)
                 if not df.empty:
                     df.index = df.index.tz_localize(None)
-                    fetched_data[sym] = df
+                    fetched_data[sym] = df.round(2)
                     financials_data[sym] = get_financial_metrics(ticker)
             except Exception as e:
                 st.warning(f"Failed to fetch {sym}: {e}")
