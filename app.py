@@ -104,12 +104,18 @@ def generate_market_excel(
     if benchmark_symbol in all_symbols:
         ordered_sheets.append(benchmark_symbol)
 
+    # PRE-CREATE ALL WORKSHEETS TO PREVENT KEYERROR DURING SCATTER CHART CREATION
+    for user_symbol in ordered_sheets:
+        sheet_title = clean_sheet_name(user_symbol)
+        if sheet_title not in wb.sheetnames:
+            wb.create_sheet(title=sheet_title)
+
     bench_clean = clean_sheet_name(benchmark_symbol)
 
     for user_symbol in ordered_sheets:
         df = data_dict[user_symbol]
         sheet_title = clean_sheet_name(user_symbol)
-        ws = wb.create_sheet(title=sheet_title)
+        ws = wb[sheet_title]
         de_ratio, tax_rate = financials_dict.get(user_symbol, (0.0, 0.25))
 
         ws.merge_cells("A1:G1")
@@ -139,7 +145,7 @@ def generate_market_excel(
 
         end_row = start_row + len(df) - 1
 
-        # NOTE: Statistical functions start at G5 to exclude row 4 (0.0% return on Day 1)
+        # Statistical functions start at G5 to exclude Row 4 (0.0% base return)
         metrics = [
             ("Avg Daily Return", f"=AVERAGE(G5:G{end_row})", "0.000%"),
             ("Annual Return", "=J4*252", "0.00%"),
@@ -292,7 +298,6 @@ start_date = st.sidebar.date_input("Start Date", datetime(2021, 4, 1))
 end_date = st.sidebar.date_input("End Date", datetime(2026, 3, 31))
 benchmark_input = st.sidebar.text_input("Benchmark Index", "NIFTY 50")
 
-# Move optional competitor mapping to Sidebar
 with st.sidebar.expander("⚙️ Optional Competitor Mapping (Advanced)", expanded=False):
     st.markdown("""
     *Specify custom peers per company to override default peer averaging.*  
@@ -352,7 +357,7 @@ if st.button("Run Financial Analysis", type="primary"):
             st.error(f"Could not fetch benchmark '{bench_symbol}'. Please verify the ticker.")
             st.stop()
 
-        # STRICT ALIGNMENT: Ensure all fetched dataframes share exact trading dates
+        # STRICT ALIGNMENT: Align trading days across all fetched assets
         common_dates = set(fetched_data[bench_symbol].index)
         for sym in fetched_data:
             common_dates = common_dates.intersection(set(fetched_data[sym].index))
@@ -395,7 +400,6 @@ if st.button("Run Financial Analysis", type="primary"):
         if sym not in metrics_cache: continue
         m = metrics_cache[sym]
         
-        # Dynamic Custom Competitor Logic Evaluation
         peer_u_beta = 0
         if sym in comp_map and comp_map[sym]:
             peers = [p for p in comp_map[sym] if p in metrics_cache]
