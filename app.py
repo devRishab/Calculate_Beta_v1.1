@@ -104,7 +104,6 @@ def generate_market_excel(
     if benchmark_symbol in all_symbols:
         ordered_sheets.append(benchmark_symbol)
 
-    sheet_data_rows = {}
     bench_clean = clean_sheet_name(benchmark_symbol)
 
     for user_symbol in ordered_sheets:
@@ -139,22 +138,22 @@ def generate_market_excel(
                 if i % 2 == 1: ws.cell(row=r_idx, column=c).fill = ZEBRA_FILL
 
         end_row = start_row + len(df) - 1
-        sheet_data_rows[sheet_title] = end_row
 
+        # NOTE: Statistical functions start at G5 to exclude row 4 (0.0% return on Day 1)
         metrics = [
-            ("Avg Daily Return", f"=AVERAGE(G4:G{end_row})", "0.000%"),
+            ("Avg Daily Return", f"=AVERAGE(G5:G{end_row})", "0.000%"),
             ("Annual Return", "=J4*252", "0.00%"),
-            ("Daily Vol", f"=_xlfn.STDEV.S(G4:G{end_row})", "0.000%"),
+            ("Daily Vol", f"=_xlfn.STDEV.S(G5:G{end_row})", "0.000%"),
             ("Annual Vol", "=J6*SQRT(252)", "0.00%"),
-            ("Daily Var", f"=_xlfn.VAR.S(G4:G{end_row})", "0.00000"),
-            (f"Covariance ({bench_clean})", f"=_xlfn.COVARIANCE.S(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00000"),
-            (f"Bench Var", f"=_xlfn.VAR.S('{bench_clean}'!G4:G{end_row})", "0.00000"),
+            ("Daily Var", f"=_xlfn.VAR.S(G5:G{end_row})", "0.00000"),
+            (f"Covariance ({bench_clean})", f"=_xlfn.COVARIANCE.S(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.00000"),
+            (f"Bench Var", f"=_xlfn.VAR.S('{bench_clean}'!G5:G{end_row})", "0.00000"),
             ("Beta (Ratio)", "=IF(J10=0, 1, J9/J10)", "0.00"),
-            ("Levered Beta", f"=SLOPE(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.00"),
+            ("Levered Beta", f"=SLOPE(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.00"),
             ("D/E Ratio", de_ratio, "0.00%"),
             ("Tax Rate", tax_rate, "0.00%"),
             ("Unlevered Beta", "=J12/(1+(1-J14)*J13)", "0.00"),
-            ("Correlation", f"=CORREL(G4:G{end_row}, '{bench_clean}'!G4:G{end_row})", "0.000")
+            ("Correlation", f"=CORREL(G5:G{end_row}, '{bench_clean}'!G5:G{end_row})", "0.000")
         ]
         
         for m_idx, (label, form, fmt) in enumerate(metrics, start=4):
@@ -167,7 +166,7 @@ def generate_market_excel(
         ws.column_dimensions["I"].width = 25
         ws.column_dimensions["J"].width = 15
 
-        # Embed Regression Scatter Plot for Target Companies
+        # Regression Scatter Chart inside Target Asset worksheets
         if user_symbol in main_assets and benchmark_symbol in data_dict:
             sc = ScatterChart()
             sc.title = f"{sheet_title} vs {bench_clean} Regression"
@@ -177,21 +176,20 @@ def generate_market_excel(
             sc.width, sc.height = 15, 10
             
             bench_sheet = wb[bench_clean]
-            # Assumes same chronological rows 
-            x_values = Reference(bench_sheet, min_col=7, min_row=4, max_row=end_row)
-            y_values = Reference(ws, min_col=7, min_row=4, max_row=end_row)
+            x_values = Reference(bench_sheet, min_col=7, min_row=5, max_row=end_row)
+            y_values = Reference(ws, min_col=7, min_row=5, max_row=end_row)
             
             series = Series(y_values, x_values, title_from_data=False)
             series.marker.symbol = "circle"
-            series.graphicalProperties.line.noFill = True # Remove connecting lines
-            series.trendline = Trendline(trendlineType="linear") # Add OLS Regression Line
+            series.graphicalProperties.line.noFill = True
+            series.trendline = Trendline(trendlineType="linear")
             
             sc.series.append(series)
             ws.add_chart(sc, "M15")
 
-    # ==========================
+    # ==========================================
     # Executive Summary Sheet
-    # ==========================
+    # ==========================================
     ws_summary = wb.create_sheet(title="Executive Summary", index=0)
     ws_summary.views.sheetView[0].showGridLines = True
     ws_summary.merge_cells("A1:K1")
@@ -222,7 +220,7 @@ def generate_market_excel(
         for c_i in range(1, 12):
             ws_summary.cell(row=s_row, column=c_i).border = BORDER_THIN
 
-    # Embed Native Excel Bar Chart for specific Betas (Raw, Unlevered, Peer Relevered)
+    # Native Excel Bar Chart
     chart = BarChart()
     chart.type = "col"
     chart.style = 10
@@ -231,11 +229,9 @@ def generate_market_excel(
     chart.x_axis.title = "Assets"
 
     cats_ref = Reference(ws_summary, min_col=1, min_row=4, max_row=3 + len(dash_df))
-    
-    # Selecting Specific non-contiguous columns for the bar chart
-    s1 = Series(Reference(ws_summary, min_col=5, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Raw Levered
-    s2 = Series(Reference(ws_summary, min_col=8, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Unlevered
-    s3 = Series(Reference(ws_summary, min_col=10, min_row=3, max_row=3 + len(dash_df)), title_from_data=True) # Peer Relevered
+    s1 = Series(Reference(ws_summary, min_col=5, min_row=3, max_row=3 + len(dash_df)), title_from_data=True)
+    s2 = Series(Reference(ws_summary, min_col=8, min_row=3, max_row=3 + len(dash_df)), title_from_data=True)
+    s3 = Series(Reference(ws_summary, min_col=10, min_row=3, max_row=3 + len(dash_df)), title_from_data=True)
     
     chart.series.extend([s1, s2, s3])
     chart.set_categories(cats_ref)
@@ -243,9 +239,9 @@ def generate_market_excel(
     chart.height = 10
     ws_summary.add_chart(chart, "M3")
 
-    # ==========================
+    # ==========================================
     # Correlation Heatmap Sheet
-    # ==========================
+    # ==========================================
     ws_corr = wb.create_sheet(title="Correlation Heatmap", index=1)
     returns_df = pd.DataFrame()
     for sym in main_assets:
@@ -296,23 +292,20 @@ start_date = st.sidebar.date_input("Start Date", datetime(2021, 4, 1))
 end_date = st.sidebar.date_input("End Date", datetime(2026, 3, 31))
 benchmark_input = st.sidebar.text_input("Benchmark Index", "NIFTY 50")
 
-# --- MAIN INPUTS ---
-col1, col2 = st.columns([1, 1])
+# Move optional competitor mapping to Sidebar
+with st.sidebar.expander("⚙️ Optional Competitor Mapping (Advanced)", expanded=False):
+    st.markdown("""
+    *Specify custom peers per company to override default peer averaging.*  
+    **Format:** `Target = Peer1, Peer2`  
+    **Example:**  
+    `TCS = INFY, WIPRO`  
+    `RELIANCE = ONGC, BPCL`  
+    *(If left blank, defaults to averaging other Target Companies).*
+    """)
+    custom_peers_str = st.text_area("Competitor Rules", height=120, placeholder="TCS = INFY, WIPRO")
 
-with col1:
-    main_tickers_str = st.text_input("Target Companies (comma-separated)", "TCS, INFY, HCLTECH, RELIANCE")
-    
-with col2:
-    with st.expander("⚙️ Optional Competitor Mapping (Advanced)", expanded=False):
-        st.markdown("""
-        *Specify custom peers per company to override default peer averaging.*  
-        **Format:** `Target = Peer1, Peer2`  
-        **Example:**  
-        `TCS = INFY, WIPRO`  
-        `RELIANCE = ONGC, BPCL`  
-        *(If left blank for any company, it defaults to averaging the other Target Companies).*
-        """)
-        custom_peers_str = st.text_area("Competitor Rules", height=100, placeholder="TCS = INFY, WIPRO")
+# --- MAIN INPUTS ---
+main_tickers_str = st.text_input("Target Companies (comma-separated)", "TCS, INFY, HCLTECH, RELIANCE")
 
 if st.button("Run Financial Analysis", type="primary"):
     main_assets = [s.strip().upper() for s in main_tickers_str.split(",") if s.strip()]
@@ -322,7 +315,7 @@ if st.button("Run Financial Analysis", type="primary"):
 
     comp_map = {}
     additional_peers = []
-    if 'custom_peers_str' in locals() and custom_peers_str.strip():
+    if custom_peers_str.strip():
         for line in custom_peers_str.strip().split("\n"):
             if "=" in line:
                 target, peers = line.split("=")
@@ -359,6 +352,15 @@ if st.button("Run Financial Analysis", type="primary"):
             st.error(f"Could not fetch benchmark '{bench_symbol}'. Please verify the ticker.")
             st.stop()
 
+        # STRICT ALIGNMENT: Ensure all fetched dataframes share exact trading dates
+        common_dates = set(fetched_data[bench_symbol].index)
+        for sym in fetched_data:
+            common_dates = common_dates.intersection(set(fetched_data[sym].index))
+        common_dates = sorted(list(common_dates))
+
+        for sym in list(fetched_data.keys()):
+            fetched_data[sym] = fetched_data[sym].loc[common_dates].copy()
+
     bench_df = fetched_data[bench_symbol]['Close']
     bench_ret = bench_df.pct_change().dropna()
 
@@ -368,18 +370,17 @@ if st.button("Run Financial Analysis", type="primary"):
         if sym not in fetched_data: continue
         target_ret = fetched_data[sym]['Close'].pct_change().dropna()
         
-        # ALIGNMENT: Prevents Variance discrepancies compared to Excel's SLOPE() 
         aligned = pd.concat([target_ret, bench_ret], axis=1).dropna()
         aligned.columns = ['Target', 'Bench']
         
         mean_ret = aligned['Target'].mean()
         ann_ret = mean_ret * 252
-        ann_vol = aligned['Target'].std() * np.sqrt(252)
+        ann_vol = aligned['Target'].std(ddof=1) * np.sqrt(252)
         
-        bench_var = aligned['Bench'].var() # Calculating strictly on overlapping mapped values
-        cov = aligned.cov().iloc[0, 1]
+        bench_var = aligned['Bench'].var(ddof=1)
+        cov = aligned['Target'].cov(aligned['Bench'])
         
-        beta_l = cov / bench_var if bench_var != 0 else 1
+        beta_l = cov / bench_var if bench_var != 0 else 1.0
         de, tax = financials_data.get(sym, (0.0, 0.25))
         beta_u = beta_l / (1 + (1 - tax) * de)
         corr = aligned['Target'].corr(aligned['Bench'])
@@ -479,7 +480,7 @@ if 'ran_analysis' in st.session_state and st.session_state['ran_analysis']:
             st.plotly_chart(fig2, use_container_width=True)
 
         st.divider()
-        st.subheader(f"📈 Regression Scatter Plots (Target vs {bench_symbol})")
+        st.subheader(f"📈 Target Companies Regression Scatter Plots (vs {bench_symbol})")
         scatter_cols = st.columns(2)
         idx = 0
         
@@ -491,7 +492,6 @@ if 'ran_analysis' in st.session_state and st.session_state['ran_analysis']:
                 aligned = pd.concat([target_ret, b_ret], axis=1).dropna()
                 aligned.columns = [sym, bench_symbol]
                 
-                # Math for custom linear regression line
                 m, c_y = np.polyfit(aligned[bench_symbol], aligned[sym], 1)
                 
                 fig_scat = px.scatter(aligned, x=bench_symbol, y=sym, opacity=0.6, title=f"{sym} Regression")
